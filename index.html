@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude JSONL Viewer</title>
+<style>
+:root{--bg:#f6f5f1;--panel:#ffffff;--text:#1f1e1d;--muted:#6b6a66;--border:#e3e1da;--user:#ece9df;--tool:#f3f1ea;--accent:#c96442;--err:#b3261e}
+@media (prefers-color-scheme:dark){:root{--bg:#262624;--panel:#30302e;--text:#eeede8;--muted:#9c9a92;--border:#43423f;--user:#3b3a37;--tool:#2a2a28;--accent:#d97757;--err:#f2665c}}
+*{box-sizing:border-box}
+body{margin:0;font:15px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--text)}
+header{position:sticky;top:0;z-index:5;background:var(--panel);border-bottom:1px solid var(--border);padding:10px 20px;display:flex;flex-wrap:wrap;gap:10px 16px;align-items:center}
+header h1{font-size:16px;margin:0 auto 0 0}
+button,label.btn{font:inherit;font-size:13px;color:var(--text);background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:5px 11px;cursor:pointer}
+button:hover,label.btn:hover{border-color:var(--accent)}
+label.opt{font-size:13px;color:var(--muted);display:flex;gap:5px;align-items:center;cursor:pointer}
+input[type=file]{display:none}
+main{max-width:900px;margin:0 auto;padding:20px 16px 80px}
+#drop{border:2px dashed var(--border);border-radius:16px;padding:70px 20px;text-align:center;color:var(--muted)}
+#drop.over{border-color:var(--accent);color:var(--text)}
+#drop strong{display:block;font-size:18px;color:var(--text);margin-bottom:6px}
+#stats{display:none;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:18px}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:10px 12px}
+.card b{display:block;font-size:20px}
+.card span{font-size:12px;color:var(--muted)}
+.card.wide{grid-column:1/-1;font-size:13px;color:var(--muted);line-height:1.7}
+.row{display:flex;gap:10px;margin:16px 0;align-items:flex-start}
+.row.user{flex-direction:row-reverse}
+.avatar{flex:none;min-width:30px;height:30px;padding:0 6px;border-radius:15px;background:var(--accent);color:#fff;display:grid;place-items:center;font-size:12px;font-weight:600}
+.row.user .avatar{background:var(--muted)}
+.row.tool-row .avatar{background:var(--border);color:var(--muted)}
+.bubble{max-width:82%;min-width:0;background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:10px 14px;overflow-wrap:anywhere}
+.row.user .bubble{background:var(--user)}
+.row.err .bubble{border-color:var(--err)}
+.row.tool-row .bubble{background:var(--tool);max-width:88%}
+.meta{font-size:11px;color:var(--muted);margin-top:6px}
+pre{margin:0;white-space:pre-wrap;word-break:break-word;font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+details{margin:6px 0;border:1px solid var(--border);border-radius:10px;background:var(--tool)}
+summary{cursor:pointer;padding:6px 10px;font-size:13px;color:var(--muted)}
+details>div{padding:0 10px 10px;max-height:480px;overflow:auto}
+.sys{margin:8px auto;max-width:82%;font-size:12px;color:var(--muted)}
+.sys details{background:transparent}
+.hide-think .think,.hide-tools .tool,.hide-tools .tool-row,.hide-meta .meta-row{display:none}
+</style>
+</head>
+<body>
+<header>
+  <h1>Claude JSONL Viewer</h1>
+  <label class="btn">Open .jsonl<input type="file" id="file" accept=".jsonl,.json,.txt"></label>
+  <label class="opt"><input type="checkbox" id="t-think" checked> Thinking</label>
+  <label class="opt"><input type="checkbox" id="t-tools" checked> Tool calls &amp; results</label>
+  <label class="opt"><input type="checkbox" id="t-meta"> System &amp; attachments</label>
+  <button id="expand">Expand all</button>
+  <button id="collapse">Collapse all</button>
+</header>
+
+<main>
+  <div id="drop"><strong>Drop a Claude Code session .jsonl file here</strong>or use “Open .jsonl” above. Files are read in your browser and never uploaded.</div>
+  <div id="stats"></div>
+  <div id="chat"></div>
+</main>
+
+<script>
+const SKIP = new Set(['last-prompt', 'mode', 'permission-mode', 'atis-latch', 'cost-state', 'file-history-snapshot']);
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmt = t => t ? new Date(t).toLocaleString() : '';
+
+const textOf = c => {
+  if (c == null) return '';
+  if (typeof c === 'string') return c;
+  if (Array.isArray(c)) return c.map(b => typeof b === 'string' ? b : b.type === 'text' ? b.text : `[${b.type || 'data'}]`).join('\n');
+  return JSON.stringify(c, null, 2);
+};
+
+const details = (title, body, cls = '') =>
+  `<details class="${cls}"><summary>${esc(title)}</summary><div><pre>${esc(body)}</pre></div></details>`;
+
+const attBody = a => {
+  const v = a.content ?? a.stdout ?? a.text ?? a;
+  return typeof v === 'string' ? v : JSON.stringify(v, null, 2);
+};
+
+function renderRecord(r) {
+  const ts = fmt(r.timestamp);
+  const meta = extra => `<div class="meta">${esc([ts, extra].filter(Boolean).join(' · '))}</div>`;
+
+  if (r.type === 'user') {
+    const c = r.message?.content;
+    if (Array.isArray(c) && c.some(b => b.type === 'tool_result')) {
+      return c.filter(b => b.type === 'tool_result').map(b => `
+        <div class="row tool-row${b.is_error ? ' err' : ''}">
+          <div class="avatar">⚙</div>
+          <div class="bubble">${details(`Tool result${b.is_error ? ' (error)' : ''} · ${b.tool_use_id ?? ''}`, textOf(b.content))}${meta('')}</div>
+        </div>`).join('');
+    }
+    return `<div class="row user"><div class="avatar">You</div><div class="bubble"><pre>${esc(textOf(c))}</pre>${meta('')}</div></div>`;
+  }
+
+  if (r.type === 'assistant') {
+    const m = r.message ?? {};
+    const blocks = Array.isArray(m.content) ? m.content : [{ type: 'text', text: textOf(m.content) }];
+    const html = blocks.map(b => {
+      if (b.type === 'text') return `<pre>${esc(b.text)}</pre>`;
+      if (b.type === 'thinking') return details('💭 Thinking', b.thinking ?? '', 'think');
+      if (b.type === 'tool_use') return details(`🔧 Tool call: ${b.name}`, JSON.stringify(b.input, null, 2), 'tool');
+      return details(`Block: ${b.type ?? '?'}`, JSON.stringify(b, null, 2));
+    }).join('');
+    const u = m.usage;
+    const usage = u ? `${u.input_tokens ?? 0} in / ${u.output_tokens ?? 0} out` : '';
+    const model = m.model && m.model !== '<synthetic>' ? m.model : '';
+    return `<div class="row${r.isApiErrorMessage ? ' err' : ''}"><div class="avatar">C</div><div class="bubble">${html}${meta([model, usage].filter(Boolean).join(' · '))}</div></div>`;
+  }
+
+  if (r.type === 'system') {
+    return `<div class="sys meta-row">${esc(r.subtype ?? 'system')}${r.durationMs ? ` · ${r.durationMs} ms` : ''} · ${esc(ts)}</div>`;
+  }
+
+  if (r.type === 'attachment') {
+    const a = r.attachment ?? {};
+    const label = '📎 ' + (a.type ?? 'attachment') + (a.hookName ? ` (${a.hookName})` : '');
+    return `<div class="sys meta-row">${details(label, attBody(a))}</div>`;
+  }
+
+  return `<div class="sys meta-row">${details('Unknown record: ' + (r.type ?? '?'), JSON.stringify(r, null, 2))}</div>`;
+}
+
+function renderStats(items, recs, name, bad) {
+  const models = new Set(), tools = {};
+  let prompts = 0, turns = 0, calls = 0, inT = 0, outT = 0, errs = 0;
+
+  items.forEach(({ r }) => {
+    if (r.type === 'user') {
+      const c = r.message?.content;
+      if (typeof c === 'string' || (Array.isArray(c) && c.some(b => b.type === 'text'))) prompts++;
+    }
+    if (r.type === 'assistant') {
+      turns++;
+      const m = r.message ?? {};
+      if (m.model && m.model !== '<synthetic>') models.add(m.model);
+      inT += m.usage?.input_tokens ?? 0;
+      outT += m.usage?.output_tokens ?? 0;
+      if (r.isApiErrorMessage) errs++;
+      if (Array.isArray(m.content)) m.content.forEach(b => {
+        if (b.type === 'tool_use') { calls++; tools[b.name] = (tools[b.name] ?? 0) + 1; }
+      });
+    }
+  });
+
+  const first = recs.find(r => r.cwd) ?? {};
+  const sid = recs.find(r => r.sessionId)?.sessionId ?? '–';
+  const stamps = items.map(x => Date.parse(x.r.timestamp)).filter(Number.isFinite);
+  const span = stamps.length ? Math.max(...stamps) - Math.min(...stamps) : 0;
+  const dur = span > 60000 ? `${Math.round(span / 60000)} min` : `${Math.round(span / 1000)} s`;
+  const toolList = Object.entries(tools).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${esc(k)} ×${v}`).join(', ') || 'none';
+
+  const card = (v, l) => `<div class="card"><b>${v}</b><span>${l}</span></div>`;
+  const el = $('#stats');
+  el.style.display = 'grid';
+  el.innerHTML = [
+    card(prompts, 'Your prompts'),
+    card(turns, 'Assistant turns'),
+    card(calls, 'Tool calls'),
+    card(inT.toLocaleString(), 'Input tokens'),
+    card(outT.toLocaleString(), 'Output tokens'),
+    card(errs, 'API errors'),
+    card(dur, 'Time span'),
+    `<div class="card wide">
+       <div>File: ${esc(name)} · ${recs.length} records${bad ? ` · ${bad} unparseable lines` : ''}</div>
+       <div>Session: ${esc(sid)} · Models: ${esc([...models].join(', ') || '–')} · Version: ${esc(first.version ?? '–')}</div>
+       <div>Working dir: ${esc(first.cwd ?? '–')}</div>
+       <div>Tools: ${toolList}</div>
+     </div>`
+  ].join('');
+}
+
+function load(text, name) {
+  let recs = [], bad = 0;
+  try { const j = JSON.parse(text); if (Array.isArray(j)) recs = j; } catch {}
+  if (!recs.length) {
+    text.split(/\r?\n/).forEach(line => {
+      if (!line.trim()) return;
+      try { recs.push(JSON.parse(line)); } catch { bad++; }
+    });
+  }
+  recs = recs.filter(r => r && typeof r === 'object');
+
+  const items = recs.map((r, i) => ({ r, i })).filter(x => !SKIP.has(x.r.type));
+  if (items.every(x => x.r.timestamp && Number.isFinite(Date.parse(x.r.timestamp)))) {
+    items.sort((a, b) => Date.parse(a.r.timestamp) - Date.parse(b.r.timestamp) || a.i - b.i);
+  }
+
+  $('#drop').style.display = 'none';
+  renderStats(items, recs, name, bad);
+  $('#chat').innerHTML = items.map(x => renderRecord(x.r)).join('') || '<p>No messages found in this file.</p>';
+  syncToggles();
+}
+
+const toggles = { 't-think': 'hide-think', 't-tools': 'hide-tools', 't-meta': 'hide-meta' };
+function syncToggles() {
+  for (const [id, cls] of Object.entries(toggles)) document.body.classList.toggle(cls, !$('#' + id).checked);
+}
+Object.keys(toggles).forEach(id => $('#' + id).addEventListener('change', syncToggles));
+
+const setAll = open => document.querySelectorAll('#chat details').forEach(d => d.open = open);
+$('#expand').onclick = () => setAll(true);
+$('#collapse').onclick = () => setAll(false);
+
+const readFile = f => f.text().then(t => load(t, f.name));
+$('#file').addEventListener('change', e => { if (e.target.files[0]) readFile(e.target.files[0]); });
+
+const drop = $('#drop');
+['dragenter', 'dragover'].forEach(ev => document.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('over'); }));
+['dragleave', 'drop'].forEach(ev => document.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('over'); }));
+document.addEventListener('drop', e => { const f = e.dataTransfer.files[0]; if (f) readFile(f); });
+
+syncToggles();
+</script>
+</body>
+</html>
